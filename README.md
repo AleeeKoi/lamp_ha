@@ -228,15 +228,15 @@ You can see the Loadbalancer logs by going to Cloud Logging--> LoadBalancer
 
 Then to go see the apache logs, see:
 
-![alt text](images/apache.png)
+![alt text](images/apache_logs.png)
 
 
-Note, the apache configuration accounts for _X-Forwarded-For_ Header:
+Note, the apache configuration accounts for _X-Forwarded-For_ Header in the apache configuration file:
 
 ```
-            SetEnvIf X-Forwarded-For "^.*\..*\..*\..*" forwarded
-            LogFormat "%h %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\"" combined
-            LogFormat "%{X-Forwarded-For}i %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\"" forwarded
+SetEnvIf X-Forwarded-For "^.*\..*\..*\..*" forwarded
+LogFormat "%h %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\"" combined
+LogFormat "%{X-Forwarded-For}i %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\"" forwarded
 ```
 
 Which means the actual orgin IP address of the browser is sent through to apache.
