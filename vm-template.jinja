@@ -1,0 +1,348 @@
+{% set PREFIX_NAME = env['deployment'] + '-' + env['name'] %}
+
+
+resources:
+- name: {{ PREFIX_NAME }}-it
+  type: compute.v1.instanceTemplate
+  properties:
+    properties:
+      machineType: f1-micro
+      serviceAccounts:
+        - email: default
+          scopes:
+            - https://www.googleapis.com/auth/sqlservice.admin
+            {% if  properties["web"]['enableSourceRepo'] %}
+            - https://www.googleapis.com/auth/source.read_only
+            {% endif %}
+            {% if  properties["web"]['enableCloudLogging'] %}
+            - https://www.googleapis.com/auth/logging.write
+            {% endif %}
+            {% if  properties["web"]['enableCloudMonitoring'] %}
+            - https://www.googleapis.com/auth/monitoring.write
+            {% endif %}
+            {% if  properties["web"]['enableCloudTrace'] %}
+            - https://www.googleapis.com/auth/trace.append
+            {% endif %}
+            - https://www.googleapis.com/auth/cloudruntimeconfig
+            - https://www.googleapis.com/auth/ndev.cloudman
+            - https://www.googleapis.com/auth/devstorage.read_write
+            - https://www.googleapis.com/auth/datastore
+      tags:
+        items:
+        -  {{ properties["web"]["instance_tag"] }}
+      networkInterfaces:
+      - network: https://www.googleapis.com/compute/v1/projects/{{ env["project"] }}/global/networks/{{ properties["network"] }}
+        accessConfigs:
+        - name: External-IP
+          type: ONE_TO_ONE_NAT
+      disks:
+      - deviceName: boot
+        type: PERSISTENT
+        boot: true
+        autoDelete: true
+        initializeParams:
+          sourceImage: https://www.googleapis.com/compute/v1/projects/debian-cloud/global/images/family/debian-9
+      metadata:
+        items:
+        - key: startup-script
+          value: |
+            #!/bin/bash
+            apt-get update && apt-get install -y apache2 php7.0 php7.0-fpm libapache2-mod-php7.0 php7.0-mysql php7.0-memcache curl composer git
+
+            export HOME=/root
+            gcloud components update -q
+            gcloud components install beta -q
+
+            INSTANCE=$(curl http://metadata.google.internal/computeMetadata/v1/instance/hostname -H "Metadata-Flavor: Google")
+
+            {% if  properties["web"]['enableCloudMonitoring'] %}
+              curl -O "https://repo.stackdriver.com/stack-install.sh"
+              bash stack-install.sh --write-gcm
+              cd /etc/httpd/conf.d/ && curl -O https://raw.githubusercontent.com/Stackdriver/stackdriver-agent-service-configs/master/etc/httpd/conf.d/status.conf
+              cd /opt/stackdriver/collectd/etc/collectd.d/ && curl -O https://raw.githubusercontent.com/Stackdriver/stackdriver-agent-service-configs/master/etc/collectd.d/apache.conf
+
+              service stackdriver-agent restart
+            {% endif %}
+
+            {% if  properties["web"]['enableCloudLogging'] %}
+              curl -sSO https://dl.google.com/cloudagents/install-logging-agent.sh
+              bash install-logging-agent.sh
+
+              #sed -i 's/format none/format apache/' /etc/google-fluentd/config.d/apache.conf
+              service google-fluentd restart
+
+            {% endif %}
+
+            {% if  properties["web"]['enableCloudTrace'] %}
+            {% endif %}
+            
+
+            echo '#!/bin/bash
+            /usr/bin/gsutil -m rsync -x "vendor/*" -r -d  gs://{{ properties["web"]["docrootBucket"] }} {{ properties["web"]["documentRoot"] }}
+            export HOME=/root
+            cd {{ properties["web"]["documentRoot"] }}
+            /usr/bin/composer install 
+            chown -R www-data:www-data {{ properties["web"]["documentRoot"] }}
+
+            db_file="<?php"
+            for instance_info in  $(gcloud sql instances list --filter=name:{{ env["deployment"] }} --format="csv[no-heading](name,project,region)")
+            do
+                  IFS=',' read -r -a instanceInfoArray<<< "$instance_info"
+                  NAME="${instanceInfoArray[0]}"
+                  PROJECT="${instanceInfoArray[1]}"
+                  REGION="${instanceInfoArray[2]}"
+
+                  conn_str="\$conn = new mysqli(null,\"root\",\"\",\"mysql\",null,\"/cloudsql/${PROJECT}:${REGION}:${NAME}\");" 
+                  db_file="${db_file}\n${conn_str}
+                  if (\$conn->connect_errno) {
+                    echo \"Failed to connect to MySQL: (\" . \$conn->connect_errno . \")\"  . \$conn->connect_error;
+                  }
+                  echo mysqli_get_host_info(\$conn). \"<br/>\" . mysqli_get_server_info(\$conn).\" to ${NAME} </br>\";"
+            done
+            p="${db_file}\n?>"
+            echo -e "${p}" > /var/www/html/db.php
+
+            chmod go-rwx {{ properties["web"]["documentRoot"] }}' > /root/resync_docroot.sh
+
+            chmod u+x /root/resync_docroot.sh
+            /root/resync_docroot.sh
+
+            echo '
+            <VirtualHost *:80>
+            ServerAdmin webmaster@localhost
+            DocumentRoot {{ properties["web"]["documentRoot"] }}
+            SetEnvIf X-Forwarded-For "^.*\..*\..*\..*" forwarded
+            LogFormat "%h %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\"" combined
+            LogFormat "%{X-Forwarded-For}i %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\"" forwarded
+            ErrorLog ${APACHE_LOG_DIR}/error.log
+            CustomLog ${APACHE_LOG_DIR}/access.log combined env=!forwarded
+            CustomLog ${APACHE_LOG_DIR}/access.log forwarded env=forwarded
+
+
+            <Directory {{ properties["web"]["documentRoot"] }}/vendor/ >
+               Allow from None
+               Order allow,deny
+            </Directory>
+
+
+            <Directory {{ properties["web"]["documentRoot"] }}/ >
+               Options -Indexes
+               DirectoryIndex index.html
+               AllowOverride None
+               Require all granted
+            </Directory>
+
+            </VirtualHost>' > /etc/apache2/sites-enabled/000-default.conf
+
+            a2enmod remoteip &&  a2enmod headers
+
+            cd /
+            wget https://dl.google.com/cloudsql/cloud_sql_proxy.linux.amd64 -O cloud_sql_proxy
+            mkdir /cloudsql; sudo chmod 777 /cloudsql
+            chmod u+x cloud_sql_proxy
+
+            export REPLICAS=""
+            {% for n in range(properties["db"]["replicaCount"]) %}
+                 REPLICAS=$REPLICAS'$(ref.{{ PREFIX_NAME }}-mysql-replica-{{n}}.connectionName),'
+            {% endfor %}
+            ./cloud_sql_proxy -dir=/cloudsql -instances=$(ref.{{ PREFIX_NAME }}-mysql-master.connectionName),$REPLICAS &
+
+
+            {% if  properties["web"]['enablersync'] %}
+             crontab -l > mycron
+             echo "*/5 * * * * /bin/bash /root/resync_docroot.sh" >> mycron
+             crontab mycron
+             rm mycron
+            {% endif %}
+
+            /etc/init.d/apache2 restart
+
+            gcloud beta runtime-config configs variables set success/{{ PREFIX_NAME }}-waiter/$INSTANCE success --config-name $(ref.{{ PREFIX_NAME }}-config.name)
+
+- name: {{ PREFIX_NAME }}-mysql-master
+  type: sqladmin.v1beta4.instance
+  properties:
+    region: {{ properties["region"] }}
+    instanceType: CLOUD_SQL_INSTANCE
+    settings:
+      tier: {{ properties["db"]["tier"] }}
+      backupConfiguration:
+        binaryLogEnabled: true
+        enabled: true
+      ipConfiguration:
+        ipv4Enabled: false
+
+{% for n in range(properties["db"]["replicaCount"]) %}
+- name: {{ PREFIX_NAME }}-mysql-replica-{{n}}
+  type: sqladmin.v1beta4.instance
+  properties:
+    region: {{ properties["region"] }}
+    masterInstanceName: $(ref.{{ PREFIX_NAME }}-mysql-master.name)
+    settings:
+      tier: {{ properties["db"]["tier"] }}
+      replicationType: {{ properties["db"]["replicationType"] }}
+      ipConfiguration:
+        ipv4Enabled: false
+{% endfor %}
+
+- name: {{ PREFIX_NAME }}-firewall-80
+  type: compute.v1.firewall
+  properties:
+    allowed:
+      - IPProtocol: TCP
+        ports: [ 80 ]
+    sourceRanges: [ 130.211.0.0/22 ]
+    targetTags: [ {{ properties["web"]["instance_tag"] }} ]
+
+
+- name: {{ PREFIX_NAME }}-igm
+  type: compute.v1.regionInstanceGroupManager
+  properties:
+    baseInstanceName: {{ PREFIX_NAME }}-instance
+    instanceTemplate: $(ref.{{ PREFIX_NAME }}-it.selfLink)
+    targetSize: {{ properties["web"]["targetSize"] }}
+    region: {{ properties["region"] }}
+
+- name: {{ PREFIX_NAME }}-as
+  type: compute.v1.regionAutoscaler
+  properties:
+    region: {{ properties["region"] }}
+    target: $(ref.{{ PREFIX_NAME }}-igm.selfLink)
+    autoscalingPolicy:
+      maxNumReplicas: {{ properties["web"]["maxReplicas"] }}
+      cpuUtilization:
+        utilizationTarget: 0.8
+      coolDownPeriodSec: 90
+
+- name: {{ PREFIX_NAME }}-hc-http
+  type: compute.v1.httpHealthCheck
+  properties:
+    port: 80
+    requestPath: /
+
+- name: {{ PREFIX_NAME }}-bes
+  type: compute.v1.backendService
+  properties:
+    port: 80
+    portName: http
+    backends:
+      - name: {{ PREFIX_NAME }}-primary
+        group: $(ref.{{ PREFIX_NAME }}-igm.instanceGroup)
+    healthChecks: [ $(ref.{{ PREFIX_NAME }}-hc-http.selfLink) ]
+
+- name: {{ PREFIX_NAME }}-beb
+  type: compute.beta.backendBucket
+  properties:
+    bucketName: {{ properties["web"]["staticBucket"] }}
+
+- name: {{ PREFIX_NAME }}-urlmap
+  type: compute.v1.urlMap
+  properties:
+    defaultService: $(ref.{{ PREFIX_NAME }}-bes.selfLink)
+    hostRules:
+      - hosts: ["*"]
+        pathMatcher: pathmap
+    pathMatchers:
+      - name: pathmap
+        defaultService: $(ref.{{ PREFIX_NAME }}-bes.selfLink)
+        pathRules:
+          - paths: ["/static/*"]
+            service: $(ref.{{ PREFIX_NAME }}-beb.selfLink)
+
+- name: {{ PREFIX_NAME }}-targetproxy
+  type: compute.v1.targetHttpsProxy
+  properties:
+    urlMap: $(ref.{{ PREFIX_NAME }}-urlmap.selfLink)
+    sslCertificates:
+      - $(ref.{{ PREFIX_NAME }}-sslcert.selfLink)
+
+- name: {{ PREFIX_NAME }}-sslcert
+  type: compute.v1.sslCertificate
+  properties:
+    certificate: |
+      -----BEGIN CERTIFICATE-----
+      MIIDyDCCArCgAwIBAgIBUTANBgkqhkiG9w0BAQsFADB3MQswCQYDVQQGEwJVUzET
+      MBEGA1UECBMKQ2FsaWZvcm5pYTEWMBQGA1UEBxMNTW91bnRhaW4gVmlldzEPMA0G
+      A1UEChMGR29vZ2xlMRMwEQYDVQQLEwpFbnRlcnByaXNlMRUwEwYDVQQDEwxUZXN0
+      Q0Fmb3JFU08wHhcNMTcwOTA2MDAxNTIwWhcNMTgwOTE2MDAxNTIwWjBqMQswCQYD
+      VQQGEwJVUzETMBEGA1UECBMKQ2FsaWZvcm5pYTEPMA0GA1UEChMGR29vZ2xlMRMw
+      EQYDVQQLEwpFbnRlcnByaXNlMSAwHgYDVQQDExdtaW5lcmFsLmVzb2RlbW9hcHAy
+      LmNvbTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAN03jJD0ShNtQU5/
+      gu1K3TXZ1vu6O27WgbMGFPKIIdNhcK4t595ytpN9gtS6FKh6RSHwDJcmtNrZpfjw
+      ZRXf43cUGNPmgCix8YI16DWubJizmtuE11T4CL2EIZgxvT6mPJthO6iYBx85pkjr
+      aCuWP1PXi81PRbxVB+xVhvUsa2MWZPDoJ6qA2O444YeWEQGlJQe28nihsLZLXslz
+      0A1PkYmywlSFw3z/yeakX4tkmvqT0VBB6ovXCrnjHUcaNe9I9PHxBdIEV4xfmtaJ
+      OS4Cw9eVc7qkzV4m8gAHLxtZ54VSClZvyVQ/NHAN/8PzZPw3VBLhtHX6CNiPm7xZ
+      Q/xyPUcCAwEAAaNsMGowCQYDVR0TBAIwADAsBglghkgBhvhCAQ0EHxYdT3BlblNT
+      TCBHZW5lcmF0ZWQgQ2VydGlmaWNhdGUwIgYDVR0RBBswGYIXbWluZXJhbC5lc29k
+      ZW1vYXBwMi5jb20wCwYDVR0PBAQDAgXgMA0GCSqGSIb3DQEBCwUAA4IBAQAu15Gg
+      0UDtDyC7vobFBYIwZ/F+eLw6s+bPUJXq3aS3URq8KtZ2oo85QOQ64fVXKdr8PCx5
+      PXJvkRUk9614emJn2yodQmvq6eItHCe0gtThSbIVTwTsYV/LnPBME/PgVZ/tlAui
+      cmf/lt+I/Q9D+lbXZdNVF76r4fsHXLTp6QZ3pXocfcmzWjQuq5gDCIu4keMBHn5R
+      mDFYDb2sWkieOZOEDaoSb2dstdNRNOgWfir+HiYWox0GZgiDKx412SSEHSDkQfKG
+      MTV2CKlTfe/hYJXDTMFMKs1TYH8ZsvtmkIoJjh0nPR2m9KomlTIe2/ztVmiwvUfr
+      DTMnEE5kB3KyNLrq
+      -----END CERTIFICATE-----
+    privateKey: |
+      -----BEGIN RSA PRIVATE KEY-----
+      MIIEowIBAAKCAQEA3TeMkPRKE21BTn+C7UrdNdnW+7o7btaBswYU8ogh02Fwri3n
+      3nK2k32C1LoUqHpFIfAMlya02tml+PBlFd/jdxQY0+aAKLHxgjXoNa5smLOa24TX
+      VPgIvYQhmDG9PqY8m2E7qJgHHzmmSOtoK5Y/U9eLzU9FvFUH7FWG9SxrYxZk8Ogn
+      qoDY7jjhh5YRAaUlB7byeKGwtkteyXPQDU+RibLCVIXDfP/J5qRfi2Sa+pPRUEHq
+      i9cKueMdRxo170j08fEF0gRXjF+a1ok5LgLD15VzuqTNXibyAAcvG1nnhVIKVm/J
+      VD80cA3/w/Nk/DdUEuG0dfoI2I+bvFlD/HI9RwIDAQABAoIBAD+dH8D3Xu3jNyp5
+      pI7UPnSj5hyRW1HuQXHXx+JOn1uH471S2iCv4CzdpOfDcvlX39V4kEZPDSb5+65w
+      gsEdlu3BS7pzyFrrgMWu9s2pEPWAgIGr27hFc038VyTK+N6xMzCDb4J15WZnT5gc
+      ieIu3JshmsQ5jZYw5Yxis+KBGYhueTFrtXbyCR8F4fvLOmApJVnIB6gxL8KMWCZR
+      abJ3Re1GbmoqdIugCs39eTCUV4AaDNyE3EgVwnhWFP6BiDOCE/ZsdHRfwlkFw3d+
+      HJx6sAiOo87vCt86Vip0x9kKQajDOMfKgCOkUEv0szgN4eo37BpNbrxEZtuJw02m
+      PilQh5ECgYEA9+KDWIqQlSIyifs3tNtk/CkL1HdhiF+fvkVe2CXEbyBnE/AVvZ8m
+      BvtWDpJKR3nHpM+JnaRXQXfkNEHh6XKMQoNcbdWTffncKjqAKiv/lXAoLwmDe7dI
+      cJ5uzMRv9eVqE3PrNVMAFFPVS7cv/gYV4EgbCxVelPKWgvffzlYKk5MCgYEA5HWJ
+      az91rxE77g+gNjtW0vQOxoW1TgYJINi2/txrNQpy42NdwbO7oHFtrcbZZQUp/16n
+      03PRsFgFaZHAJ3iMrAN674I8+imsGmPG7m0I9gOvf3YOabf3410nccXrSvAQza9f
+      AZ/DYMPwxlm9wHM2XfJBvmi996lvbWARvIJRJ/0CgYBOtvw0gpPU964KyN5wrPaN
+      aE9cYah0EMF+PzMV+jA9hZGV8DhHJaGCuA8kw2mY9t/hwxGVIJmgrXym54Dgi8Jk
+      YKhaLGcQquYx9q+6NIyNnLb18NRy1cnIEVdn6L0Q3Y/oq3e2UCwHSHPD/mDcDnyl
+      4t/Ljjahn8MRxbqpIANtxwKBgQCjBGumJ4YmAbotyOCdUgJGTPguGEKjBhOFaJ5L
+      haTKGEaaktDX4xRDDC0jDv0Y5HJvUm+WptI9btGN3v6qK47VPzZ9qQUxzIKN4hyV
+      DSCTy1VzMh5euXMcvd/jg0K+GkcjPbwhQIr9hVNNdcO8i3mD19WptLu4+SIVfbOq
+      O6MFUQKBgFWHgoxdlUA4/P6PYF9J2eWyPXm/UBSLattVs738SNWc+t20jfStcYqM
+      hytHNnLa4oNKRdCY4LXE0ONzCu2tIPC498FIJfk9hHo/xmjGmuF3GGucxYnhRBV9
+      yS51pilWOxBxuEOHOvEeBSRLRBPWWsL6eg9zo+D9evAq0drx1mNq
+      -----END RSA PRIVATE KEY-----
+
+- name: {{ PREFIX_NAME }}-l7lb
+  type: compute.v1.globalForwardingRule
+  properties:
+    IPProtocol: TCP
+    portRange: 443
+    region: {{ properties["region"] }}
+    target: $(ref.{{ PREFIX_NAME }}-targetproxy.selfLink)
+
+- type: runtimeconfig.v1beta1.config
+  name: {{ PREFIX_NAME }}-config
+  properties:
+    config: {{ PREFIX_NAME }}-config
+
+- type: runtimeconfig.v1beta1.waiter
+  name: {{ PREFIX_NAME }}-waiter
+  metadata:
+    dependsOn:
+    - {{ PREFIX_NAME }}-config
+  properties:
+    parent: $(ref.{{ PREFIX_NAME }}-config.name)
+    waiter: {{ PREFIX_NAME }}-waiter
+    timeout: 1200s
+    success:
+      cardinality:
+        path: /success
+        number: {{ properties["web"]["targetSize"] }}
+    failure:
+      cardinality:
+        path: /failure
+        number: {{ properties["web"]["targetSize"] }}
+
+outputs:
+- name: {{ PREFIX_NAME }}-l7lb
+  value: $(ref.{{ PREFIX_NAME }}-l7lb.IPAddress)

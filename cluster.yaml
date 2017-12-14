@@ -1,0 +1,28 @@
+
+imports:
+- path: vm-template.jinja
+
+resources:
+- name: cluster
+  type: vm-template.jinja
+  properties:
+    network: default
+    zone: us-central1-a
+    region: us-central1
+
+    web:
+      instance_tag: apache
+      targetSize: 5
+      maxReplicas: 5
+
+      staticBucket: compact-circlet-189020-mylampstaticroot 
+      docrootBucket: compact-circlet-189020-mylampdocroot
+      documentRoot: /var/www/html
+      enableCloudLogging: true
+      enableCloudMonitoring: true
+      enableCloudTrace: true
+      enablersync: false
+    db:
+      tier: db-n1-standard-1
+      replicaCount: 1
+      replicationType: SYNCHRONOUS
