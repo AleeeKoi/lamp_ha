@@ -1,5 +1,5 @@
 {
     "require": {
-        "google/cloud-trace": "*"
+        "google/cloud-trace": "v0.3.3"
     }
 }
