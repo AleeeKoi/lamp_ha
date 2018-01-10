@@ -15,8 +15,8 @@ resources:
       targetSize: 5
       maxReplicas: 5
 
-      staticBucket: compact-circlet-189020-mylampstaticroot 
-      docrootBucket: compact-circlet-189020-mylampdocroot
+      staticBucket:  mineral-minutia-820-mylampstaticroot
+      docrootBucket: mineral-minutia-820-mylampdocroot
       documentRoot: /var/www/html
       enableCloudLogging: true
       enableCloudMonitoring: true
